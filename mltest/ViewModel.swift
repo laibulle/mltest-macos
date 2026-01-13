@@ -513,48 +513,6 @@ class TextRecognitionViewModel {
     
     // MARK: - Document Detection
     
-    /// Applies perspective correction using detected rectangle corners
-    private func applyPerspectiveCorrection(to image: CIImage, with observation: VNRectangleObservation) -> CIImage? {
-        let imageSize = image.extent.size
-        
-        let topLeft = CGPoint(
-            x: observation.topLeft.x * imageSize.width,
-            y: observation.topLeft.y * imageSize.height
-        )
-        let topRight = CGPoint(
-            x: observation.topRight.x * imageSize.width,
-            y: observation.topRight.y * imageSize.height
-        )
-        let bottomLeft = CGPoint(
-            x: observation.bottomLeft.x * imageSize.width,
-            y: observation.bottomLeft.y * imageSize.height
-        )
-        let bottomRight = CGPoint(
-            x: observation.bottomRight.x * imageSize.width,
-            y: observation.bottomRight.y * imageSize.height
-        )
-        
-        print("   Top-left: (\(topLeft.x), \(topLeft.y))")
-        print("   Top-right: (\(topRight.x), \(topRight.y))")
-        print("   Bottom-left: (\(bottomLeft.x), \(bottomLeft.y))")
-        print("   Bottom-right: (\(bottomRight.x), \(bottomRight.y))")
-        
-        if let perspectiveFilter = CIFilter(name: "CIPerspectiveCorrection") {
-            perspectiveFilter.setValue(image, forKey: kCIInputImageKey)
-            perspectiveFilter.setValue(CIVector(cgPoint: topLeft), forKey: "inputTopLeft")
-            perspectiveFilter.setValue(CIVector(cgPoint: topRight), forKey: "inputTopRight")
-            perspectiveFilter.setValue(CIVector(cgPoint: bottomLeft), forKey: "inputBottomLeft")
-            perspectiveFilter.setValue(CIVector(cgPoint: bottomRight), forKey: "inputBottomRight")
-            
-            if let correctedImage = perspectiveFilter.outputImage {
-                print("✅ Applied perspective correction (deskewed)")
-                return correctedImage
-            }
-        }
-        
-        return nil
-    }
-    
     /// Crops image to content boundaries (top, bottom, left, right edges)
     private func cropToContentBoundaries(image: CIImage, segmentationResult: VNPixelBufferObservation) -> CIImage? {
         let pixelBuffer = segmentationResult.pixelBuffer
