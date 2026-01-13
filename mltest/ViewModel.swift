@@ -513,128 +513,6 @@ class TextRecognitionViewModel {
     
     // MARK: - Document Detection
     
-    /// Detects a document in the image using Vision ML and crops to content boundaries
-    private func detectAndCropDocument(_ image: CIImage) -> CIImage? {
-        // Convert CIImage to CGImage for Vision request
-        let context = CIContext(options: [.useSoftwareRenderer: false])
-        guard let cgImage = context.createCGImage(image, from: image.extent) else {
-            print("❌ Failed to convert CIImage to CGImage for document detection")
-            return nil
-        }
-        
-        // Create a high-contrast grayscale version to help rectangle detection
-        let rectDetectInput: CGImage = {
-            if let gray = CIFilter(name: "CIColorControls") {
-                gray.setValue(image, forKey: kCIInputImageKey)
-                gray.setValue(0.0, forKey: kCIInputSaturationKey)
-                gray.setValue(1.2, forKey: kCIInputContrastKey)
-                gray.setValue(0.0, forKey: kCIInputBrightnessKey)
-                let out = gray.outputImage ?? image
-                return context.createCGImage(out, from: out.extent) ?? cgImage
-            }
-            return cgImage
-        }()
-        
-        // Create Vision request for document segmentation
-        let request = VNDetectDocumentSegmentationRequest()
-        
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        
-        do {
-            try handler.perform([request])
-            
-            guard let segmentationResult = request.results?.first as? VNPixelBufferObservation else {
-                print("📄 No document detected by Vision ML")
-                return nil
-            }
-            
-            print("📄 Document detected by Vision ML with confidence: \(String(format: "%.2f", segmentationResult.confidence))")
-            
-            // Try to get the document rectangle for perspective correction first
-            let rectangleRequest = VNDetectRectanglesRequest()
-            rectangleRequest.minimumAspectRatio = 0.2
-            rectangleRequest.maximumAspectRatio = 1.0
-            rectangleRequest.minimumSize = 0.2
-            rectangleRequest.quadratureTolerance = 20.0
-            rectangleRequest.minimumConfidence = 0.3
-            rectangleRequest.maximumObservations = 10
-            
-            let rectHandler = VNImageRequestHandler(cgImage: rectDetectInput, options: [:])
-            try rectHandler.perform([rectangleRequest])
-            
-            if let rectangles = rectangleRequest.results, !rectangles.isEmpty {
-                // Score rectangles by area coverage and vertical position (prefer larger, higher ones)
-                let scored = rectangles.map { rect -> (VNRectangleObservation, CGFloat) in
-                    let box = rect.boundingBox
-                    let area = box.width * box.height
-                    // Prefer rectangles that cover a large area and are closer to the top (page region)
-                    let score = area - (1.0 - box.maxY) * 0.05
-                    return (rect, score)
-                }.sorted { $0.1 > $1.1 }
-
-                if let best = scored.first?.0, let corrected = applyPerspectiveCorrection(to: image, with: best) {
-                    print("📄 Rectangle detected - strict crop applied")
-                    return corrected
-                }
-            }
-            
-            // Strict contour-based fallback: detect a strong horizontal edge (page bottom)
-            if #available(macOS 12.0, *) {
-                let contoursRequest = VNDetectContoursRequest()
-                contoursRequest.contrastAdjustment = 1.0
-                contoursRequest.detectsDarkOnLight = true
-                contoursRequest.maximumImageDimension = 1024
-                let edgeHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-                do {
-                    try edgeHandler.perform([contoursRequest])
-                    if let observation = contoursRequest.results?.first as? VNContoursObservation {
-                        var bottomY: CGFloat = 0
-                        // Search for a long, mostly horizontal contour near the lower half
-                        for idx in 0..<observation.contourCount {
-                            if let contour = try? observation.contour(at: idx) {
-                                let points = contour.normalizedPoints
-                                guard points.count > 2 else { continue }
-                                // Compute bounding box of the contour
-                                var minX: CGFloat = 1, maxX: CGFloat = 0, minY: CGFloat = 1, maxY: CGFloat = 0
-                                for p in points {
-                                    minX = min(minX, CGFloat(p.x))
-                                    maxX = max(maxX, CGFloat(p.x))
-                                    minY = min(minY, CGFloat(p.y))
-                                    maxY = max(maxY, CGFloat(p.y))
-                                }
-                                let width = maxX - minX
-                                let height = maxY - minY
-                                // Heuristics: very wide, very short, and low in the image
-                                if width > 0.6 && height < 0.06 && minY < 0.8 {
-                                    // Map to image coordinates (Vision normalized origin bottom-left)
-                                    let yInImage = minY * image.extent.height
-                                    bottomY = max(bottomY, yInImage)
-                                }
-                            }
-                        }
-                        if bottomY > 0 {
-                            let strictRect = CGRect(x: image.extent.origin.x, y: bottomY, width: image.extent.width, height: image.extent.height - bottomY)
-                            print("📏 Strict contour crop applied at y=\(Int(bottomY))")
-                            return image.cropped(to: strictRect)
-                        }
-                    }
-                } catch {
-                    // Ignore and fall back
-                }
-            }
-            
-            // Otherwise, crop strictly to the content boundaries using the segmentation result
-            print("📄 No clear rectangle - cropping to content boundaries")
-            return cropToContentBoundaries(image: image, segmentationResult: segmentationResult)
-            
-        } catch {
-            print("❌ Error detecting document: \(error.localizedDescription)")
-            return nil
-        }
-        
-        return nil
-    }
-    
     /// Applies perspective correction using detected rectangle corners
     private func applyPerspectiveCorrection(to image: CIImage, with observation: VNRectangleObservation) -> CIImage? {
         let imageSize = image.extent.size
@@ -861,7 +739,7 @@ class TextRecognitionViewModel {
         print("📐 Original image size: \(ciImage.extent.width) x \(ciImage.extent.height)")
         
         // Step 0: Detect and crop the document rectangle
-        if let detectedPage = detectAndCropDocument(ciImage) {
+        if let detectedPage =  DocumentCropper.detectAndCropDocument(ciImage) {
             processedImage = detectedPage
             ciImage = detectedPage // Update base image
             print("📄 Document detected and cropped to: \(detectedPage.extent.width) x \(detectedPage.extent.height)")
