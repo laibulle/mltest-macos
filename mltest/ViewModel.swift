@@ -522,6 +522,19 @@ class TextRecognitionViewModel {
             return nil
         }
         
+        // Create a high-contrast grayscale version to help rectangle detection
+        let rectDetectInput: CGImage = {
+            if let gray = CIFilter(name: "CIColorControls") {
+                gray.setValue(image, forKey: kCIInputImageKey)
+                gray.setValue(0.0, forKey: kCIInputSaturationKey)
+                gray.setValue(1.2, forKey: kCIInputContrastKey)
+                gray.setValue(0.0, forKey: kCIInputBrightnessKey)
+                let out = gray.outputImage ?? image
+                return context.createCGImage(out, from: out.extent) ?? cgImage
+            }
+            return cgImage
+        }()
+        
         // Create Vision request for document segmentation
         let request = VNDetectDocumentSegmentationRequest()
         
@@ -539,20 +552,78 @@ class TextRecognitionViewModel {
             
             // Try to get the document rectangle for perspective correction first
             let rectangleRequest = VNDetectRectanglesRequest()
-            rectangleRequest.minimumAspectRatio = 0.3
+            rectangleRequest.minimumAspectRatio = 0.2
             rectangleRequest.maximumAspectRatio = 1.0
-            rectangleRequest.minimumSize = 0.3
-            rectangleRequest.maximumObservations = 1
+            rectangleRequest.minimumSize = 0.2
+            rectangleRequest.quadratureTolerance = 20.0
+            rectangleRequest.minimumConfidence = 0.3
+            rectangleRequest.maximumObservations = 10
             
-            try handler.perform([rectangleRequest])
+            let rectHandler = VNImageRequestHandler(cgImage: rectDetectInput, options: [:])
+            try rectHandler.perform([rectangleRequest])
             
-            // If we have a clear rectangle, use perspective correction
-            if let rectangleObservation = rectangleRequest.results?.first {
-                print("📄 Clear rectangle detected - applying perspective correction")
-                return applyPerspectiveCorrection(to: image, with: rectangleObservation)
+            if let rectangles = rectangleRequest.results, !rectangles.isEmpty {
+                // Score rectangles by area coverage and vertical position (prefer larger, higher ones)
+                let scored = rectangles.map { rect -> (VNRectangleObservation, CGFloat) in
+                    let box = rect.boundingBox
+                    let area = box.width * box.height
+                    // Prefer rectangles that cover a large area and are closer to the top (page region)
+                    let score = area - (1.0 - box.maxY) * 0.05
+                    return (rect, score)
+                }.sorted { $0.1 > $1.1 }
+
+                if let best = scored.first?.0, let corrected = applyPerspectiveCorrection(to: image, with: best) {
+                    print("📄 Rectangle detected - strict crop applied")
+                    return corrected
+                }
             }
             
-            // Otherwise, just crop to the content boundaries using the segmentation result
+            // Strict contour-based fallback: detect a strong horizontal edge (page bottom)
+            if #available(macOS 12.0, *) {
+                let contoursRequest = VNDetectContoursRequest()
+                contoursRequest.contrastAdjustment = 1.0
+                contoursRequest.detectsDarkOnLight = true
+                contoursRequest.maximumImageDimension = 1024
+                let edgeHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                do {
+                    try edgeHandler.perform([contoursRequest])
+                    if let observation = contoursRequest.results?.first as? VNContoursObservation {
+                        var bottomY: CGFloat = 0
+                        // Search for a long, mostly horizontal contour near the lower half
+                        for idx in 0..<observation.contourCount {
+                            if let contour = try? observation.contour(at: idx) {
+                                let points = contour.normalizedPoints
+                                guard points.count > 2 else { continue }
+                                // Compute bounding box of the contour
+                                var minX: CGFloat = 1, maxX: CGFloat = 0, minY: CGFloat = 1, maxY: CGFloat = 0
+                                for p in points {
+                                    minX = min(minX, CGFloat(p.x))
+                                    maxX = max(maxX, CGFloat(p.x))
+                                    minY = min(minY, CGFloat(p.y))
+                                    maxY = max(maxY, CGFloat(p.y))
+                                }
+                                let width = maxX - minX
+                                let height = maxY - minY
+                                // Heuristics: very wide, very short, and low in the image
+                                if width > 0.6 && height < 0.06 && minY < 0.8 {
+                                    // Map to image coordinates (Vision normalized origin bottom-left)
+                                    let yInImage = minY * image.extent.height
+                                    bottomY = max(bottomY, yInImage)
+                                }
+                            }
+                        }
+                        if bottomY > 0 {
+                            let strictRect = CGRect(x: image.extent.origin.x, y: bottomY, width: image.extent.width, height: image.extent.height - bottomY)
+                            print("📏 Strict contour crop applied at y=\(Int(bottomY))")
+                            return image.cropped(to: strictRect)
+                        }
+                    }
+                } catch {
+                    // Ignore and fall back
+                }
+            }
+            
+            // Otherwise, crop strictly to the content boundaries using the segmentation result
             print("📄 No clear rectangle - cropping to content boundaries")
             return cropToContentBoundaries(image: image, segmentationResult: segmentationResult)
             
@@ -608,73 +679,158 @@ class TextRecognitionViewModel {
     
     /// Crops image to content boundaries (top, bottom, left, right edges)
     private func cropToContentBoundaries(image: CIImage, segmentationResult: VNPixelBufferObservation) -> CIImage? {
-        // Get the pixel buffer containing the segmentation mask
         let pixelBuffer = segmentationResult.pixelBuffer
-        
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        
+
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
             print("❌ Failed to get pixel buffer base address")
             return nil
         }
-        
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
-        
-        // Find content boundaries by scanning the mask
-        var minX = width
-        var maxX = 0
-        var minY = height
-        var maxY = 0
-        
+
+        // Binary mask: treat > 0 as foreground
+        var visited = [Bool](repeating: false, count: width * height)
+        var bestMinX = width, bestMaxX = 0, bestMinY = height, bestMaxY = 0
+        var bestCount = 0
+
+        // 4-neighborhood flood fill to find largest connected component
+        let directions = [(0,1),(1,0),(0,-1),(-1,0)]
+        func idx(_ x:Int,_ y:Int) -> Int { y * width + x }
+
         for y in 0..<height {
             for x in 0..<width {
-                let pixelValue = buffer[y * bytesPerRow + x]
-                
-                // If pixel is part of document (non-zero in mask)
-                if pixelValue > 0 {
-                    minX = min(minX, x)
-                    maxX = max(maxX, x)
-                    minY = min(minY, y)
-                    maxY = max(maxY, y)
+                let i = idx(x,y)
+                if visited[i] { continue }
+                let isOn = buffer[y * bytesPerRow + x] > 0
+                if !isOn { visited[i] = true; continue }
+
+                // BFS
+                var queue: [(Int,Int)] = [(x,y)]
+                visited[i] = true
+                var count = 0
+                var minX = x, maxX = x, minY = y, maxY = y
+                while !queue.isEmpty {
+                    let (cx, cy) = queue.removeFirst()
+                    count += 1
+                    minX = min(minX, cx); maxX = max(maxX, cx)
+                    minY = min(minY, cy); maxY = max(maxY, cy)
+                    for (dx,dy) in directions {
+                        let nx = cx + dx, ny = cy + dy
+                        if nx < 0 || ny < 0 || nx >= width || ny >= height { continue }
+                        let ni = idx(nx, ny)
+                        if visited[ni] { continue }
+                        if buffer[ny * bytesPerRow + nx] > 0 {
+                            visited[ni] = true
+                            queue.append((nx, ny))
+                        } else {
+                            visited[ni] = true
+                        }
+                    }
+                }
+                if count > bestCount {
+                    bestCount = count
+                    bestMinX = minX; bestMaxX = maxX
+                    bestMinY = minY; bestMaxY = maxY
                 }
             }
         }
-        
-        // Add small padding (2% of dimensions)
-        let paddingX = Int(Double(width) * 0.02)
-        let paddingY = Int(Double(height) * 0.02)
-        
-        minX = max(0, minX - paddingX)
-        maxX = min(width - 1, maxX + paddingX)
-        minY = max(0, minY - paddingY)
-        maxY = min(height - 1, maxY + paddingY)
-        
-        // Convert mask coordinates to image coordinates
+
+        if bestCount == 0 { return nil }
+
+        // Convert mask coordinates to image coordinates (strict, no padding)
         let imageSize = image.extent.size
         let scaleX = imageSize.width / CGFloat(width)
         let scaleY = imageSize.height / CGFloat(height)
-        
         let cropRect = CGRect(
-            x: CGFloat(minX) * scaleX,
-            y: CGFloat(minY) * scaleY,
-            width: CGFloat(maxX - minX) * scaleX,
-            height: CGFloat(maxY - minY) * scaleY
+            x: CGFloat(bestMinX) * scaleX,
+            y: CGFloat(bestMinY) * scaleY,
+            width: CGFloat(bestMaxX - bestMinX + 1) * scaleX,
+            height: CGFloat(bestMaxY - bestMinY + 1) * scaleY
         )
-        
-        print("📄 Content boundaries detected:")
-        print("   Crop rect: (\(cropRect.origin.x), \(cropRect.origin.y)) - \(cropRect.width) x \(cropRect.height)")
-        
-        // Crop the image
-        let croppedImage = image.cropped(to: cropRect)
-        
-        print("✅ Cropped to content boundaries")
-        
-        return croppedImage
+
+        print("📄 Strict segmentation crop (largest component): (\(Int(cropRect.origin.x)), \(Int(cropRect.origin.y))) - \(Int(cropRect.width)) x \(Int(cropRect.height))")
+        return image.cropped(to: cropRect)
+    }
+
+    /// Detects a solid dark band at the bottom and crops it off
+    private func cropBottomBlackBand(from image: CIImage, maxScanHeightRatio: CGFloat = 0.3, luminanceThreshold: CGFloat = 0.12, minBandHeightRatio: CGFloat = 0.03) -> CIImage {
+        // Render a downscaled grayscale bitmap for fast scanning
+        let extent = image.extent
+        let width = Int(extent.width)
+        let height = Int(extent.height)
+        let maxScanHeight = Int(CGFloat(height) * maxScanHeightRatio)
+        let minBandHeight = Int(CGFloat(height) * minBandHeightRatio)
+
+        // Create context and grayscale image
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        let colorControls = CIFilter(name: "CIColorControls")!
+        colorControls.setValue(image, forKey: kCIInputImageKey)
+        colorControls.setValue(0.0, forKey: kCIInputSaturationKey)
+        colorControls.setValue(1.0, forKey: kCIInputContrastKey)
+        colorControls.setValue(0.0, forKey: kCIInputBrightnessKey)
+        let grayImage = colorControls.outputImage ?? image
+
+        // Downscale to manageable size to speed up scanning
+        let targetWidth = 512
+        let scale = CGFloat(targetWidth) / extent.width
+        let targetHeight = max(1, Int(extent.height * scale))
+        let transform = CGAffineTransform(scaleX: scale, y: scale)
+        let scaled = grayImage.transformed(by: transform)
+
+        guard let cg = context.createCGImage(scaled, from: CGRect(x: 0, y: 0, width: CGFloat(targetWidth), height: CGFloat(targetHeight))) else {
+            return image
+        }
+
+        // Read pixel data (assume 8-bit RGBA)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerPixel = 4
+        let bytesPerRow = targetWidth * bytesPerPixel
+        var data = [UInt8](repeating: 0, count: bytesPerRow * targetHeight)
+        guard let bitmapCtx = CGContext(data: &data, width: targetWidth, height: targetHeight, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return image
+        }
+        bitmapCtx.draw(cg, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+
+        // Scan from bottom up to find contiguous dark rows
+        var darkRows = 0
+        var bandHeightRows = 0
+        let scanLimit = min(maxScanHeight, targetHeight)
+
+        rowLoop: for row in 0..<scanLimit {
+            let y = targetHeight - 1 - row
+            var avgLuma: CGFloat = 0
+            for x in 0..<targetWidth {
+                let idx = y * bytesPerRow + x * bytesPerPixel
+                let r = CGFloat(data[idx]) / 255.0
+                let g = CGFloat(data[idx + 1]) / 255.0
+                let b = CGFloat(data[idx + 2]) / 255.0
+                // Rec. 709 luma
+                avgLuma += 0.2126 * r + 0.7152 * g + 0.0722 * b
+            }
+            avgLuma /= CGFloat(targetWidth)
+            if avgLuma < luminanceThreshold {
+                darkRows += 1
+            } else {
+                // If we already started seeing dark rows and now a light row, stop
+                if darkRows > 0 { break rowLoop }
+            }
+        }
+
+        bandHeightRows = darkRows
+        if bandHeightRows <= 0 { return image }
+
+        // Require a minimum band height to avoid cropping legitimate content
+        if bandHeightRows < Int(CGFloat(targetHeight) * minBandHeightRatio) { return image }
+
+        // Map band height back to original image space
+        let bandHeightInOriginal = Int((CGFloat(bandHeightRows) / CGFloat(targetHeight)) * extent.height)
+        let cropRect = CGRect(x: extent.origin.x, y: extent.origin.y + CGFloat(bandHeightInOriginal), width: extent.width, height: extent.height - CGFloat(bandHeightInOriginal))
+        print("🪓 Cropping bottom dark band: \(bandHeightInOriginal) px (~\(bandHeightRows) rows at \(targetHeight)px))")
+        return image.cropped(to: cropRect)
     }
     
     // MARK: - Image Preprocessing
@@ -711,6 +867,14 @@ class TextRecognitionViewModel {
             print("📄 Document detected and cropped to: \(detectedPage.extent.width) x \(detectedPage.extent.height)")
         } else {
             print("⚠️ No document rectangle detected, using full image")
+            
+            // Attempt to crop a potential bottom black band
+            let croppedForBand = cropBottomBlackBand(from: processedImage)
+            if !croppedForBand.extent.equalTo(processedImage.extent) {
+                processedImage = croppedForBand
+                ciImage = croppedForBand
+                print("✂️ Removed bottom black band. New size: \(processedImage.extent.width) x \(processedImage.extent.height)")
+            }
         }
         
         // Step 1: Upscale if image is small (improves OCR on low-res photos)
