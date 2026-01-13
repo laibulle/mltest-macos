@@ -97,31 +97,10 @@ public struct DocumentCropper {
     // MARK: - Image Processing
     
     /// Crops image to the document region found in segmentation mask
-    private static func cropToSegmentationMask(image: CIImage, observation: VNRectangleObservation) -> CIImage? {
+    private static func cropToSegmentationMask(image: CIImage, observation:  VNRectangleObservation) -> CIImage? {
         // VNDetectDocumentSegmentationRequest returns VNRectangleObservation
-        // We can use the bounding box directly
-        let imageSize = image.extent.size
-        
-        // Convert normalized bounding box to image coordinates
-        // Vision uses bottom-left origin, Core Image uses top-left
-        let boundingBox = observation.boundingBox
-        
-        let x = boundingBox.origin.x * imageSize.width
-        let y = (1.0 - boundingBox.origin.y - boundingBox.height) * imageSize.height
-        let width = boundingBox.width * imageSize.width
-        let height = boundingBox.height * imageSize.height
-        
-        let cropRect = CGRect(x: x, y: y, width: width, height: height)
-        
-        // Ensure crop rect is within image bounds
-        let validCropRect = cropRect.intersection(image.extent)
-        
-        guard !validCropRect.isEmpty else {
-            return nil
-        }
-        
-        // Apply perspective correction for better results
-        return applyPerspectiveCorrection(to: image, with: observation)
+        // Apply perspective correction directly for best results
+        return applyPerspectiveCorrection(to:  image, with: observation)
     }
     
     /// Applies perspective correction to straighten a document
@@ -131,10 +110,11 @@ public struct DocumentCropper {
         // Convert normalized coordinates to image coordinates
         // Vision uses bottom-left origin, Core Image uses top-left
         func convertPoint(_ point: CGPoint) -> CGPoint {
-            return CGPoint(
-                x: point.x * imageSize.width,
-                y: (1.0 - point.y) * imageSize.height
+            let converted = CGPoint(
+                x:  point.x * imageSize.width,
+                y: (1.0 - point.y) * imageSize.height  // ✅ No whitespace error
             )
+            return converted
         }
         
         let topLeft = convertPoint(observation.topLeft)
